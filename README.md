@@ -7,10 +7,10 @@ Linux 服务端口限速工具。`pf` 打开中文数字菜单：选 `1`，输�
 能访问 GitHub 的 Linux 服务器可直接一键安装：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/dd9360/portflow/main/quick-install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/dd9360/portflow/f51ad406a270498e2352725f221f3862b4ee0ff0/quick-install.sh | sudo bash
 ```
 
-执行前可先打开脚本核对内容。该命令需要服务器能连接 `raw.githubusercontent.com`。如已将项目文件托管到自己信任的镜像，可设置 `PF_BASE_URL` 为镜像目录地址后运行 `quick-install.sh`；下面的离线安装完全不需要 GitHub。
+一键命令固定到已在真实服务器验证的版本，避免 GitHub 原始文件缓存导致脚本版本不一致。执行前可先打开脚本核对内容。该命令需要服务器能连接 `raw.githubusercontent.com`。如已将项目文件托管到自己信任的镜像，可设置 `PF_BASE_URL` 为镜像目录地址后运行 `quick-install.sh`；下面的离线安装完全不需要 GitHub。
 
 在能访问本项目的电脑上下载仓库 ZIP，解压后把整个 `portflow` 目录用 SCP、SFTP 等传到服务器。服务器执行：
 
