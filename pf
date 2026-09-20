@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+STATE_DIR=${PF_STATE_DIR:-/etc/portflow}
+CONFIG="$STATE_DIR/rules.tsv"
+IFACE_FILE="$STATE_DIR/interface"
+PREF=42424
+
+die() { echo "错误：$*" >&2; exit 1; }
+need_root() { [[ $EUID -eq 0 ]] || die '请使用 root 运行（sudo pf）。'; }
+valid_port() { [[ ${1:-} =~ ^[0-9]+$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 )); }
+valid_rate() { [[ ${1:-} =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v x="$1" 'BEGIN { exit !(x > 0 && x <= 100000) }'; }
+valid_proto() { [[ ${1:-} == tcp || ${1:-} == udp || ${1:-} == both ]]; }
+iface() {
+  if [[ -s $IFACE_FILE ]]; then cat "$IFACE_FILE"; else
+    ip -4 route show default | awk '($1=="default") {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}'
+  fi
+}
+check_iface() { [[ $1 =~ ^[a-zA-Z0-9_.:-]+$ ]] && ip link show dev "$1" >/dev/null 2>&1 || die "网卡不存在：$1"; }
+init() { mkdir -p "$STATE_DIR"; touch "$CONFIG"; chmod 600 "$CONFIG"; }
+check_deps() { command -v tc >/dev/null && command -v ip >/dev/null || die '缺少 iproute2（tc/ip），请先安装。'; }
+
+# One police action index per port and direction, shared by IPv4/IPv6 and TCP/UDP.
+# Ingress dst_port = traffic entering the server; egress src_port = leaving it.
+add_filters() {
+  local dev=$1 port=$2 up=$3 down=$4 proto=$5 direction family transport rate idx key first
+  for direction in ingress egress; do
+    if [[ $direction == ingress ]]; then rate=$down; key=dst_port; idx=$((1000000 + port*2));
+    else rate=$up; key=src_port; idx=$((1000000 + port*2 + 1)); fi
+    first=1
+    for family in ip ipv6; do
+      for transport in tcp udp; do
+        [[ $proto == both || $proto == "$transport" ]] || continue
+        if (( first )); then
+          tc filter add dev "$dev" "$direction" protocol "$family" pref "$PREF" flower \
+            ip_proto "$transport" "$key" "$port" \
+            action police rate "${rate}mbit" burst 256k conform-exceed drop/ok index "$idx"
+          first=0
+        else
+          tc filter add dev "$dev" "$direction" protocol "$family" pref "$PREF" flower \
+            ip_proto "$transport" "$key" "$port" action police index "$idx"
+        fi
+      done
+    done
+  done
+}
+
+clear_ours() {
+  local dev=$1 dir family
+  for dir in ingress egress; do
+    # Only our priority for each family; leave shared clsact intact.
+    for family in ip ipv6; do
+      tc filter del dev "$dev" "$dir" protocol "$family" pref "$PREF" 2>/dev/null || true
+    done
+  done
+}
+
+apply() {
+  need_root; check_deps; init
+  local dev port up down proto
+  dev=$(iface); [[ -n $dev ]] || die '无法识别默认网卡，请使用 pf interface 网卡名。'
+  check_iface "$dev"
+  if ! tc qdisc show dev "$dev" | grep -q 'qdisc clsact '; then
+    tc qdisc add dev "$dev" clsact || die '无法创建 clsact；检查是否已有不兼容的 tc 配置。'
+  fi
+  clear_ours "$dev"
+  while IFS=$'\t' read -r port up down proto; do
+    [[ -n $port ]] || continue
+    valid_port "$port" && valid_rate "$up" && valid_rate "$down" && valid_proto "$proto" || die '配置文件存在无效规则。'
+    add_filters "$dev" "$port" "$up" "$down" "$proto" || die "端口 $port 应用失败；请运行 pf apply 重试。"
+  done < "$CONFIG"
+  echo "规则已应用到 $dev。"
+}
+
+add() {
+  need_root; init
+  local port=${1:-} up=${2:-} down=${3:-$up} proto=${4:-both} tmp
+  valid_port "$port" || die '端口须为 1–65535。'
+  valid_rate "$up" && valid_rate "$down" || die '速率须为大于 0 且不超过 100000 的数字（单位 Mbit/s）。'
+  valid_proto "$proto" || die '协议须为 tcp、udp 或 both。'
+  tmp=$(mktemp "$STATE_DIR/.rules.XXXXXX")
+  awk -F '\t' -v p="$port" '$1 != p' "$CONFIG" > "$tmp"
+  printf '%s\t%s\t%s\t%s\n' "$port" "$up" "$down" "$proto" >> "$tmp"
+  chmod 600 "$tmp"; mv "$tmp" "$CONFIG"
+  apply
+}
+remove() {
+  need_root; init
+  local port=${1:-} tmp
+  valid_port "$port" || die '请输入有效端口。'
+  awk -F '\t' -v p="$port" '$1 == p {found=1} END {exit !found}' "$CONFIG" || die "端口 $port 没有规则。"
+  tmp=$(mktemp "$STATE_DIR/.rules.XXXXXX")
+  awk -F '\t' -v p="$port" '$1 != p' "$CONFIG" > "$tmp"
+  chmod 600 "$tmp"; mv "$tmp" "$CONFIG"
+  apply
+}
+list() {
+  init
+  printf '%-8s %-12s %-12s %s\n' '端口' '上传(Mbps)' '下载(Mbps)' '协议'
+  awk -F '\t' 'NF==4 {printf "%-8s %-12s %-12s %s\n",$1,$2,$3,$4}' "$CONFIG"
+  echo "网卡：$(iface)"
+}
+set_iface() {
+  need_root; check_deps; [[ -n ${1:-} ]] || die '用法：pf interface 网卡名'
+  check_iface "$1"; init
+  local old; old=$(iface)
+  printf '%s\n' "$1" > "$IFACE_FILE"
+  [[ -z $old || $old == "$1" ]] || clear_ours "$old"
+  apply
+}
+menu() {
+  need_root
+  local choice port up down proto dev
+  while :; do
+    echo; echo '=== PortFlow 端口限速 ==='
+    echo '1) 查看规则  2) 添加/修改  3) 删除  4) 选择网卡  5) 重载  0) 退出'
+    read -r -p '请选择：' choice || return
+    case "$choice" in
+      1) list ;;
+      2) read -r -p '服务端口：' port; read -r -p '上传限速 (Mbps)：' up
+         read -r -p '下载限速 (Mbps，回车同上传)：' down
+         read -r -p '协议 tcp/udp/both (回车 both)：' proto
+         add "$port" "$up" "${down:-$up}" "${proto:-both}" ;;
+      3) read -r -p '删除端口：' port; remove "$port" ;;
+      4) read -r -p '网卡名：' dev; set_iface "$dev" ;;
+      5) apply ;;
+      0) return ;;
+      *) echo '无效选择。' ;;
+    esac
+  done
+}
+case ${1:-menu} in
+  menu) menu;; add) shift; add "$@";; del|delete|remove) shift; remove "$@";;
+  list|ls) list;; apply|reload) apply;; interface) shift; set_iface "$@";;
+  *) echo '用法：pf [menu | list | add 端口 上传Mbps [下载Mbps] [tcp|udp|both] | del 端口 | interface 网卡 | apply]' >&2; exit 2;;
+esac

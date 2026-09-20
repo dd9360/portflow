@@ -1,0 +1,12 @@
+[Unit]
+Description=Restore PortFlow traffic limits
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/pf apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
