@@ -100,6 +100,23 @@ list() {
   awk -F '\t' 'NF==4 {printf "%-8s %-12s %-12s %s\n",$1,$2,$3,$4}' "$CONFIG"
   echo "网卡：$(iface)"
 }
+traffic() {
+  need_root; check_deps; init
+  local port up down proto sent received output bytes
+  printf '%-8s %-16s %-16s\n' '端口' '上传' '下载'
+  while IFS=$'\t' read -r port up down proto; do
+    [[ -n $port ]] || continue
+    sent='--'; received='--'
+    output=$(tc -s actions get action police index "$((1000000 + port*2 + 1))" 2>/dev/null) || output=''
+    bytes=$(printf '%s\n' "$output" | awk '$1=="Sent" && $2 ~ /^[0-9]+$/ {print $2; exit}')
+    [[ -z $bytes ]] || sent=$(awk -v b="$bytes" 'BEGIN {printf "%.2f MiB", b/1048576}')
+    output=$(tc -s actions get action police index "$((1000000 + port*2))" 2>/dev/null) || output=''
+    bytes=$(printf '%s\n' "$output" | awk '$1=="Sent" && $2 ~ /^[0-9]+$/ {print $2; exit}')
+    [[ -z $bytes ]] || received=$(awk -v b="$bytes" 'BEGIN {printf "%.2f MiB", b/1048576}')
+    printf '%-8s %-16s %-16s\n' "$port" "$sent" "$received"
+  done < "$CONFIG"
+  echo '流量从最近一次规则应用后累计；重载、修改规则或重启会清零。-- 表示计数器不可用。'
+}
 set_iface() {
   need_root; check_deps; [[ -n ${1:-} ]] || die '用法：pf interface 网卡名'
   check_iface "$1"; init
@@ -110,20 +127,31 @@ set_iface() {
 }
 menu() {
   need_root
-  local choice port up down proto dev
+  local choice port rate dev
   while :; do
     echo; echo '=== PortFlow 端口限速 ==='
-    echo '1) 查看规则  2) 添加/修改  3) 删除  4) 选择网卡  5) 重载  0) 退出'
+    echo '1) 添加/修改限速端口'
+    echo '2) 删除限速端口'
+    echo '3) 查看限速规则'
+    echo '4) 查看端口流量统计'
+    echo '5) 设置网卡'
+    echo '6) 重载规则'
+    echo '0) 退出'
     read -r -p '请选择：' choice || return
     case "$choice" in
-      1) list ;;
-      2) read -r -p '服务端口：' port; read -r -p '上传限速 (Mbps)：' up
-         read -r -p '下载限速 (Mbps，回车同上传)：' down
-         read -r -p '协议 tcp/udp/both (回车 both)：' proto
-         add "$port" "$up" "${down:-$up}" "${proto:-both}" ;;
-      3) read -r -p '删除端口：' port; remove "$port" ;;
-      4) read -r -p '网卡名：' dev; set_iface "$dev" ;;
-      5) apply ;;
+      1) read -r -p '请输入端口号：' port || return
+         valid_port "$port" || { echo '端口须为 1–65535。'; continue; }
+         read -r -p '请输入限速（M，上传和下载各自独立）：' rate || return
+         valid_rate "$rate" || { echo '限速须为大于 0 且不超过 100000 的数字。'; continue; }
+         add "$port" "$rate" "$rate" both
+         echo "端口 $port 上传和下载分别限速 ${rate}M，已返回主菜单。" ;;
+      2) read -r -p '请输入要删除的端口号：' port || return
+         valid_port "$port" || { echo '端口须为 1–65535。'; continue; }
+         if awk -F '\t' -v p="$port" '$1 == p {found=1} END {exit !found}' "$CONFIG"; then remove "$port"; else echo "端口 $port 没有规则。"; fi ;;
+      3) list ;;
+      4) traffic ;;
+      5) read -r -p '请输入网卡名：' dev || return; set_iface "$dev" ;;
+      6) apply ;;
       0) return ;;
       *) echo '无效选择。' ;;
     esac
@@ -131,6 +159,6 @@ menu() {
 }
 case ${1:-menu} in
   menu) menu;; add) shift; add "$@";; del|delete|remove) shift; remove "$@";;
-  list|ls) list;; apply|reload) apply;; interface) shift; set_iface "$@";;
+  list|ls) list;; traffic|stats) traffic;; apply|reload) apply;; interface) shift; set_iface "$@";;
   *) echo '用法：pf [menu | list | add 端口 上传Mbps [下载Mbps] [tcp|udp|both] | del 端口 | interface 网卡 | apply]' >&2; exit 2;;
 esac
