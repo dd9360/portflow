@@ -4,7 +4,8 @@ set -Eeuo pipefail
 STATE_DIR=${PF_STATE_DIR:-/etc/portflow}
 CONFIG="$STATE_DIR/rules.tsv"
 IFACE_FILE="$STATE_DIR/interface"
-PREF=42424
+PREF4=42424
+PREF6=42425
 
 die() { echo "错误：$*" >&2; exit 1; }
 need_root() { [[ $EUID -eq 0 ]] || die '请使用 root 运行（sudo pf）。'; }
@@ -23,22 +24,23 @@ check_deps() { command -v tc >/dev/null && command -v ip >/dev/null || die '缺�
 # One police action index per port and direction, shared by IPv4/IPv6 and TCP/UDP.
 # Ingress dst_port = traffic entering the server; egress src_port = leaving it.
 add_filters() {
-  local dev=$1 port=$2 up=$3 down=$4 proto=$5 direction family transport rate idx key first
+  local dev=$1 port=$2 up=$3 down=$4 proto=$5 direction family transport rate idx key first pref
   for direction in ingress egress; do
     if [[ $direction == ingress ]]; then rate=$down; key=dst_port; idx=$((1000000 + port*2));
     else rate=$up; key=src_port; idx=$((1000000 + port*2 + 1)); fi
     first=1
     for family in ip ipv6; do
+      if [[ $family == ip ]]; then pref=$PREF4; else pref=$PREF6; fi
       for transport in tcp udp; do
         [[ $proto == both || $proto == "$transport" ]] || continue
         if (( first )); then
-          tc filter add dev "$dev" "$direction" protocol "$family" pref "$PREF" flower \
+          tc filter add dev "$dev" "$direction" protocol "$family" pref "$pref" flower \
             ip_proto "$transport" "$key" "$port" \
-            action police rate "${rate}mbit" burst 256k conform-exceed drop/ok index "$idx"
+            action police rate "${rate}mbit" burst 256k conform-exceed drop/ok index "$idx" || return 1
           first=0
         else
-          tc filter add dev "$dev" "$direction" protocol "$family" pref "$PREF" flower \
-            ip_proto "$transport" "$key" "$port" action police index "$idx"
+          tc filter add dev "$dev" "$direction" protocol "$family" pref "$pref" flower \
+            ip_proto "$transport" "$key" "$port" action police index "$idx" || return 1
         fi
       done
     done
@@ -46,12 +48,11 @@ add_filters() {
 }
 
 clear_ours() {
-  local dev=$1 dir family
+  local dev=$1 dir
   for dir in ingress egress; do
-    # Only our priority for each family; leave shared clsact intact.
-    for family in ip ipv6; do
-      tc filter del dev "$dev" "$dir" protocol "$family" pref "$PREF" 2>/dev/null || true
-    done
+    # Each protocol has its own priority. Leave shared clsact intact.
+    tc filter del dev "$dev" "$dir" protocol ip pref "$PREF4" 2>/dev/null || true
+    tc filter del dev "$dev" "$dir" protocol ipv6 pref "$PREF6" 2>/dev/null || true
   done
 }
 
